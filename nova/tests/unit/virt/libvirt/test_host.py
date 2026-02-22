@@ -73,7 +73,21 @@ class HostTestCase(test.NoDBTestCase):
         super(HostTestCase, self).setUp()
 
         self.useFixture(nova_fixtures.LibvirtFixture())
-        self.host = host.Host("qemu:///system")
+        self.host = self._create_host("qemu:///system")
+
+    def _create_host(self, *args, **kwargs):
+        h = host.Host(*args, **kwargs)
+        self.addCleanup(h.cleanup)
+        # We need this explicitly as the majority of the test cases using
+        # a Host object does not care about the event handling thread, and
+        # it is disabled and poisoned. But test cases in this class trying
+        # to cover code there. So we partially instantiate the event handling
+        # logic here and pumping the events in the test cases individually.
+        h._delayed_executor = (
+            utils.StaticallyDelayingCancellableTaskExecutorWrapper(
+                delay=15, executor=utils._get_default_executor()))
+
+        return h
 
     def test_repeat_initialization(self):
         for i in range(3):
@@ -134,8 +148,10 @@ class HostTestCase(test.NoDBTestCase):
         def handler(event):
             got_events.append(event)
 
-        hostimpl = host.Host("qemu:///system",
+        hostimpl = self._create_host("qemu:///system",
                              lifecycle_event_handler=handler)
+        hostimpl.initialize()
+
         got_events = []
 
         event1 = event.LifecycleEvent(
@@ -173,7 +189,7 @@ class HostTestCase(test.NoDBTestCase):
 
     @mock.patch('nova.virt.libvirt.host.Host._event_emit_delayed')
     def test_event_lifecycle(self, mock_emit):
-        hostimpl = host.Host("qemu:///system",
+        hostimpl = self._create_host("qemu:///system",
                              lifecycle_event_handler=lambda e: None)
 
         conn = hostimpl.get_connection()
@@ -283,8 +299,10 @@ class HostTestCase(test.NoDBTestCase):
         ev = event.LifecycleEvent(
             "cef19ce0-0ca2-11df-855d-b19fbce37686",
             event.EVENT_LIFECYCLE_STOPPED)
-        hostimpl = host.Host(
+        hostimpl = self._create_host(
             'qemu:///system', lifecycle_event_handler=lambda e: None)
+        hostimpl.initialize()
+
         hostimpl._event_emit_delayed(ev)
         mock_wrapper.assert_called_once_with(
             delay=15, executor=utils._get_default_executor())
@@ -293,7 +311,7 @@ class HostTestCase(test.NoDBTestCase):
 
     @mock.patch('nova.utils.StaticallyDelayingCancellableTaskExecutorWrapper')
     def test_event_emit_delayed_call_delayed_pending(self, mock_wrapper):
-        hostimpl = host.Host(
+        hostimpl = self._create_host(
             'qemu:///system', lifecycle_event_handler=lambda e: None)
         uuid = "cef19ce0-0ca2-11df-855d-b19fbce37686"
 
@@ -306,7 +324,7 @@ class HostTestCase(test.NoDBTestCase):
         self.assertIs(mock_future, hostimpl._events_delayed[uuid])
 
     def test_event_delayed_cleanup(self):
-        hostimpl = host.Host(
+        hostimpl = self._create_host(
             'qemu:///system', lifecycle_event_handler=lambda e: None)
         uuid = "cef19ce0-0ca2-11df-855d-b19fbce37686"
         ev = event.LifecycleEvent(
@@ -316,6 +334,25 @@ class HostTestCase(test.NoDBTestCase):
         hostimpl._event_emit_delayed(ev)
         gt_mock.cancel.assert_called_once_with()
         self.assertNotIn(uuid, hostimpl._events_delayed.keys())
+
+    def test_host_cleanup_cancels_delayed_events(self):
+        hostimpl = self._create_host(
+            'qemu:///system', lifecycle_event_handler=lambda e: None)
+        uuid = "cef19ce0-0ca2-11df-855d-b19fbce37686"
+        ev = event.LifecycleEvent(
+            uuid, event.EVENT_LIFECYCLE_STOPPED)
+
+        hostimpl._event_emit_delayed(ev)
+
+        self.assertIn(uuid, hostimpl._events_delayed)
+        future = hostimpl._events_delayed[uuid]
+        self.assertFalse(future.cancelled())
+        self.assertTrue(hostimpl._delayed_executor.is_alive)
+
+        hostimpl.cleanup()
+
+        self.assertTrue(future.cancelled())
+        self.assertFalse(hostimpl._delayed_executor.is_alive)
 
     def test_device_removed_event(self):
         hostimpl = mock.MagicMock()
@@ -418,7 +455,7 @@ class HostTestCase(test.NoDBTestCase):
     @mock.patch.object(host.Host, "_connect")
     def test_conn_event(self, mock_conn):
         handler = mock.MagicMock()
-        h = host.Host("qemu:///system", conn_event_handler=handler)
+        h = self._create_host("qemu:///system", conn_event_handler=handler)
 
         h.get_connection()
         h._dispatch_conn_event()
@@ -428,7 +465,7 @@ class HostTestCase(test.NoDBTestCase):
     @mock.patch.object(host.Host, "_connect")
     def test_conn_event_fail(self, mock_conn):
         handler = mock.MagicMock()
-        h = host.Host("qemu:///system", conn_event_handler=handler)
+        h = self._create_host("qemu:///system", conn_event_handler=handler)
         mock_conn.side_effect = fakelibvirt.libvirtError('test')
 
         self.assertRaises(exception.HypervisorUnavailable, h.get_connection)
@@ -451,7 +488,7 @@ class HostTestCase(test.NoDBTestCase):
     @mock.patch.object(host.Host, "_connect")
     def test_conn_event_up_down(self, mock_conn, mock_test_conn):
         handler = mock.MagicMock()
-        h = host.Host("qemu:///system", conn_event_handler=handler)
+        h = self._create_host("qemu:///system", conn_event_handler=handler)
         mock_conn.side_effect = (mock.MagicMock(),
                                  fakelibvirt.libvirtError('test'))
         mock_test_conn.return_value = False
@@ -473,7 +510,8 @@ class HostTestCase(test.NoDBTestCase):
         # This emulates LibvirtDriver._handle_conn_event
         def conn_event_handler(*args, **kwargs):
             event.set()
-        h = host.Host("qemu:///system", conn_event_handler=conn_event_handler)
+        h = self._create_host(
+            "qemu:///system", conn_event_handler=conn_event_handler)
         h.initialize()
 
         h.get_connection()
@@ -2193,6 +2231,10 @@ class TestLibvirtSEV(test.NoDBTestCase):
 
         self.useFixture(nova_fixtures.LibvirtFixture())
         self.host = host.Host("qemu:///system")
+        self.addCleanup(self.host.cleanup)
+        self.host._delayed_executor = (
+            utils.StaticallyDelayingCancellableTaskExecutorWrapper(
+                delay=0.1, executor=utils._get_default_executor()))
 
 
 @ddt.ddt
@@ -2360,6 +2402,10 @@ class LibvirtTpoolProxyTestCase(test.NoDBTestCase):
 
         self.useFixture(nova_fixtures.LibvirtFixture())
         self.host = host.Host("qemu:///system")
+        self.host._delayed_executor = (
+            utils.StaticallyDelayingCancellableTaskExecutorWrapper(
+                delay=0.1, executor=utils._get_default_executor()))
+        self.addCleanup(self.host.cleanup)
 
         def _stub_xml(uuid):
             return ("<domain>"

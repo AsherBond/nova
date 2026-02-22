@@ -197,6 +197,7 @@ class TestCase(base.BaseTestCase):
 
         self.useFixture(nova_fixtures.OpenStackSDKFixture())
         self.useFixture(nova_fixtures.IsolatedExecutorFixture(self.id()))
+        self.useFixture(nova_fixtures.DelayingExecutorWrapperCleanupFixture())
 
         self.useFixture(log_fixture.get_logging_handle_error_fixture())
 

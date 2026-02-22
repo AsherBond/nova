@@ -4139,15 +4139,20 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
 
     @mock.patch.object(objects.InstanceList, 'get_by_host')
     def test_sync_power_states(self, mock_get):
+        # Force an RLock as the test uses a sync executor as the task is run
+        # on the caller thread and both the caller and the task needs the lock
+        self.compute._syncs_in_progress_lock = threading.RLock()
         instance = mock.Mock()
         mock_get.return_value = [instance]
-        with mock.patch('nova.utils.spawn_on') as mock_spawn:
+        with mock.patch.object(
+            self.compute, '_query_driver_power_state_and_sync'
+        ) as mock_sync:
             self.compute._sync_power_states(mock.sentinel.context)
-            mock_get.assert_called_with(mock.sentinel.context,
-                                        self.compute.host, expected_attrs=[],
-                                        use_slave=True)
-            mock_spawn.assert_called_once_with(
-                self.compute._sync_power_executor, mock.ANY, instance)
+
+        mock_get.assert_called_with(mock.sentinel.context,
+                                    self.compute.host, expected_attrs=[],
+                                    use_slave=True)
+        mock_sync.assert_called_once_with(mock.sentinel.context, instance)
 
     @mock.patch('nova.objects.InstanceList.get_by_host', new=mock.Mock())
     @mock.patch('nova.compute.manager.ComputeManager.'

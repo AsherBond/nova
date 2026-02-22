@@ -587,20 +587,6 @@ def spawn(
     return spawn_on(_get_default_executor(), func, *args, **kwargs)
 
 
-def spawn_after(
-    seconds: float,
-    func: ty.Callable[..., ty.Any],
-    *args: ty.Any, **kwargs: ty.Any
-) -> futurist.Future:
-    """Executing the function asynchronously after the given time."""
-
-    def delayed(*args, **kwargs):
-        time.sleep(seconds)
-        return func(*args, **kwargs)
-
-    return spawn(delayed, *args, **kwargs)
-
-
 def _executor_is_full(executor: Executor) -> bool:
     if concurrency_mode_threading():
         # TODO(gibi): Move this whole logic to futurist ThreadPoolExecutor
@@ -630,7 +616,7 @@ def spawn_on(
             "The %s pool does not have free threads so the task %s will be "
             "queued. If this happens repeatedly then the size of the pool is "
             "too small for the load or there are stuck threads filling the "
-            "pool.", executor.name, func)
+            "pool.", getattr(executor, "name", "unknown"), func)
 
     _context = common_context.get_current()
     profiler_info = _serialize_profile_info()
@@ -1186,7 +1172,7 @@ def latch_error_on_raise(retryable=(_SentinelException,)):
 class FairLockGuard:
     """A lock guard context manager
 
-    This class support acquiring multiple locks safely by name
+    This class supports acquiring multiple locks safely by name
     and releasing them via the context manager protocol
     i.e. with FairLockGuard([list of lock names]):
 
@@ -1195,33 +1181,42 @@ class FairLockGuard:
     the locks and passing them in. Lock creation and management
     is handled entirely internally.
 
-    If you are using this between threads, Thread-A and Thread-B
-    should both create there own context manager instead of sharing
-    a single context manager between treads.
+    Thread Safety:
+        While sharing a FairLockGuard instance between threads is
+        supported, it is discouraged. Each thread should create its
+        own context manager instance with the same set of lock names
+        for clarity and to avoid confusion about lock ownership. If
+        shared, threads will correctly wait for each other due to the
+        underlying fair locks.
 
-    Nesting is supported by creating a new context manager instance
-    for each nested context with the same or different lock names
-    as the outer context. Attempting to nest the same context manager
-    instance should raise a TypeError.
+    Nesting:
+        Same-instance nesting is supported but discouraged. When the
+        same thread re-enters an active context manager, the nesting
+        depth is tracked and locks are only released on the outermost
+        exit. For clarity, prefer creating separate FairLockGuard
+        instances for nested contexts.
 
-    Example Valid Usage:
+    Example Recommended Usage:
     ```
-    with FairLockGuard(['lock1', 'lock2']) as lock_guard:
-        with FairLockGuard(['lock1', 'lock2']) as lock_guard2:
+    # Each context creates its own guard - clear ownership
+    with FairLockGuard(['lock1', 'lock2']):
+        with FairLockGuard(['lock1', 'lock2']):
             pass
     ```
 
-    Example Invalid Usage:
+    Example Discouraged (but supported) Usage:
     ```
-    with FairLockGuard(['lock1', 'lock2']) as lock_guard:
-        with lock_guard:
-            pass
+    # Same instance nesting - works but less clear
+    lock_guard = FairLockGuard(['lock1', 'lock2'])
+    with lock_guard:
+        with lock_guard:  # Increments nesting depth
+            pass          # Decrements but doesn't release
+        pass              # Still holds locks
+    # Locks released here
     ```
-    This will raise a TypeError because the same context manager instance
-    is being nested.
 
     In general you should avoid naming the context manager instance
-    and only construct it in the with statement to avoid incorrect usage.
+    and only construct it in the with statement to keep usage clear.
     """
 
     def __init__(self, names):
@@ -1241,33 +1236,87 @@ class FairLockGuard:
         # exclusive access for state modifications.
         self.locks_lock = lockutils.ReaderWriterLock()
         self._active = False
+        self._active_thread = None
+        self._nesting_depth = 0
+
+    @staticmethod
+    def _release_locks(locks):
+        for lock in locks:
+            if lock.is_writer():
+                try:
+                    lock.release_write_lock()
+                except Exception:
+                    pass
 
     def __enter__(self):
+        current_thread = threading.current_thread()
+
+        # Check for same-thread nesting - allow it by incrementing depth
         with self.locks_lock.write_lock():
-            if self._active:
-                raise TypeError(
-                    "Cannot enter FairLockGuard while it is already active. "
-                    "Create a new instance for nested usage or wait for the "
-                    "current context to exit.")
+            if self._active and self._active_thread == current_thread:
+                # Same thread re-entering - just increment depth.
+                # Locks are already held, no need to re-acquire.
+                self._nesting_depth += 1
+                return
+
+        # First entry (or different thread that will wait on named locks).
+        # IMPORTANT: Acquire named locks OUTSIDE of locks_lock to prevent
+        # deadlock. If we acquired named locks while holding locks_lock:
+        #   1. Thread-A holds locks_lock, acquires named locks, releases
+        #      locks_lock, does work
+        #   2. Thread-B takes locks_lock, blocks waiting for named locks
+        #      (still holding locks_lock)
+        #   3. Thread-A tries to __exit__, needs locks_lock - DEADLOCK!
+        # By acquiring named locks outside locks_lock, Thread-B blocks on
+        # named locks without holding locks_lock, allowing Thread-A to exit.
+        #
+        # NOTE: We append to acquired_locks BEFORE calling
+        # acquire_write_lock().
+        # This ordering is intentional for exception safety: if acquire fails
+        # for a lock, we can still release all previously acquired locks
+        # (the is_writer() check ensures we only release locks that were
+        # actually acquired).
+        acquired_locks = []
+        try:
             for name in self.names:
                 named_lock = NOVA_FAIR_LOCKS.get(name)
-                self.locks.append(named_lock)
-                # we ensure we add it to the list
-                # before we acquire the lock to make sure
-                # we release it if there is an exception
+                acquired_locks.append(named_lock)
                 named_lock.acquire_write_lock()
+        except Exception:
+            # Release any locks acquired so far on failure
+            self._release_locks(acquired_locks)
+            raise
+
+        # Update internal state after acquiring locks
+        with self.locks_lock.write_lock():
+            self.locks = acquired_locks
             self._active = True
+            self._active_thread = current_thread
+            self._nesting_depth = 1
 
     def __exit__(self, exc_type, exc_value, traceback):
+        current_thread = threading.current_thread()
         with self.locks_lock.write_lock():
-            for lock in self.locks:
-                # This should always be true but since
-                # we add the lock to the list before we
-                # acquire it check anyway.
-                if lock.is_writer():
-                    lock.release_write_lock()
+            # Validate the exiting thread owns the lock. This handles the
+            # edge case where a shared guard's __exit__ is called from a
+            # thread that didn't successfully __enter__ (e.g., Thread-B
+            # calls exit while Thread-A holds nested locks). In normal
+            # context manager usage this shouldn't happen, but we handle
+            # it defensively by returning early without modifying state.
+            if self._active_thread != current_thread:
+                return
+
+            self._nesting_depth -= 1
+            if self._nesting_depth > 0:
+                # Still nested, don't release locks yet
+                return
+        # Release locks OUTSIDE of locks_lock to prevent holding it
+        # while other threads may be waiting
+        self._release_locks(self.locks)
+        with self.locks_lock.write_lock():
             self.locks = []
             self._active = False
+            self._active_thread = None
 
     def is_locked(self):
         # NOTE(sean-k-mooney): LockGuards exist in several programming

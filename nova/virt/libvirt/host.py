@@ -346,9 +346,7 @@ class Host(object):
         #                STARTED events are sent. To prevent shutting
         #                down the domain during a reboot, delay the
         #                STOPPED lifecycle event some seconds.
-        self._delayed_executor = (
-            utils.StaticallyDelayingCancellableTaskExecutorWrapper(
-                delay=15, executor=utils._get_default_executor()))
+        self._delayed_executor = None
 
         self._initialized = False
         self._libvirt_proxy_classes = self._get_libvirt_proxy_classes(libvirt)
@@ -560,7 +558,7 @@ class Host(object):
             event.transition == virtevent.EVENT_LIFECYCLE_STOPPED):
             # Delay STOPPED event, as they may be followed by a STARTED
             # event in case the instance is rebooting
-            future = self._delayed_executor.submit_with_delay(
+            future = self._delayed_executor.submit_with_delay(  # type: ignore
                 self._event_emit, event)
             self._events_delayed[event.uuid] = future
             # add callback to cleanup self._events_delayed dict after
@@ -577,6 +575,9 @@ class Host(object):
     def _init_events(self):
         """Initializes the libvirt events subsystem.
         """
+        self._delayed_executor = (
+            utils.StaticallyDelayingCancellableTaskExecutorWrapper(
+                delay=15, executor=utils._get_default_executor()))
         self._event_handler.start()
 
         # This thread is just for async connection closed event handling.
@@ -704,6 +705,23 @@ class Host(object):
         self._init_events()
 
         self._initialized = True
+
+    def cleanup(self):
+        # TODO(gibi): We might want to stop the _event_handler here as well
+        # as the _conn_event_thread loop to have a fully graceful and clean
+        # shutdown
+
+        # If domain STOPPED events are delayed then the executor shutdown can
+        # take up to 15 seconds. Also as nova-compute is shutting down not
+        # having a power off synced to the DB does not matter much as during
+        # the next nova-compute startup the power states are synced anyhow. So
+        # lets cancel all the outstanding delayed events instead of waiting a
+        # lot.
+        for future in list(self._events_delayed.values()):
+            future.cancel()
+
+        if self._delayed_executor:
+            self._delayed_executor.shutdown(wait=True)
 
     def _version_check(self, lv_ver=None, hv_ver=None, hv_type=None,
                        op=operator.lt):

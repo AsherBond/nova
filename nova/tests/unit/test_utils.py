@@ -21,6 +21,7 @@ import threading
 import time
 from unittest import mock
 
+import fasteners
 import fixtures
 from keystoneauth1 import adapter as ks_adapter
 from keystoneauth1.identity import base as ks_identity
@@ -1559,17 +1560,40 @@ class SpawnOnTestCase(test.NoDBTestCase):
             'nova.tests.unit.test_utils.SpawnOnTestCase.'
             'test_spawn_on_warns_on_full_executor.cell_worker', task)
 
+    @mock.patch.object(
+        utils, 'concurrency_mode_threading', new=mock.Mock(return_value=True))
+    @mock.patch.object(utils.LOG, 'warning')
+    def test_spawn_on_warns_on_full_executor_noname(self, mock_warning):
+        # Ensure we have executor for a single task only at a time
+        executor = utils.create_executor(max_workers=1)
 
-class SpawnAfterTestCase(test.NoDBTestCase):
-    @mock.patch.object(time, "sleep")
-    def test_spawn_after_submits_work_after_delay(self, mock_sleep):
-        task = mock.MagicMock()
+        work = threading.Event()
+        started = threading.Event()
 
-        future = utils.spawn_after(0.1, task, 13, foo='bar')
-        future.result()
+        # let the blocked tasks finish after the test case so that the leaked
+        # thread check is not triggered during cleanup
+        self.addCleanup(work.set)
 
-        task.assert_called_once_with(13, foo='bar')
-        mock_sleep.assert_called_once_with(0.1)
+        def task():
+            started.set()
+            work.wait()
+
+        # Start two tasks that will wait, the first will execute the second
+        # will wait in the queue
+        utils.spawn_on(executor, task)
+        utils.spawn_on(executor, task)
+        # wait for the first task to consume the single executor thread
+        started.wait()
+        # start one more task to trigger the fullness check.
+        utils.spawn_on(executor, task)
+
+        # We expect that spawn_on will warn due to the second task being is
+        # waiting in the queue, and no idle worker thread exists.
+        mock_warning.assert_called_once_with(
+            'The %s pool does not have free threads so the task %s will be '
+            'queued. If this happens repeatedly then the size of the pool is '
+            'too small for the load or there are stuck threads filling the '
+            'pool.', 'unknown', task)
 
 
 class ExecutorStatsTestCase(test.NoDBTestCase):
@@ -1974,22 +1998,81 @@ class TestFairLockGuard(test.NoDBTestCase):
             self.assertTrue(test_locks[0].is_writer())
             self.assertTrue(test_locks[1].is_writer())
 
-        # attempting to nest the same context manager instance
-        # should raise a TypeError.
+        # Same instance nesting now works - locks are already held,
+        # so nested entry just increments depth counter.
         with lock_guard:
             self.assertTrue(lock_guard.is_locked())
             self.assertTrue(test_locks[0].is_writer())
             self.assertTrue(test_locks[1].is_writer())
-            with self.assertRaisesRegex(
-                TypeError,
-                "Cannot enter FairLockGuard while it is already active."):
-                with lock_guard:
-                    pass
-            # after the TypeError, the outer context should still
-            # be active.
+            with lock_guard:
+                # Still locked in nested context
+                self.assertTrue(lock_guard.is_locked())
+                self.assertTrue(test_locks[0].is_writer())
+                self.assertTrue(test_locks[1].is_writer())
+            # Still locked after inner exit
             self.assertTrue(lock_guard.is_locked())
             self.assertTrue(test_locks[0].is_writer())
             self.assertTrue(test_locks[1].is_writer())
+        # Released after outer exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_locks[0].is_writer())
+        self.assertFalse(test_locks[1].is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_deep_nesting(self, mock_fair_locks):
+        """Test that nesting works correctly at 3+ levels deep."""
+        test_lock = fasteners.ReaderWriterLock()
+        mock_fair_locks.get.return_value = test_lock
+        lock_guard = utils.FairLockGuard(['deep-test'])
+
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            with lock_guard:
+                self.assertTrue(lock_guard.is_locked())
+                with lock_guard:
+                    # Third level of nesting
+                    self.assertTrue(lock_guard.is_locked())
+                    self.assertTrue(test_lock.is_writer())
+                # Still locked after level 3 exit
+                self.assertTrue(lock_guard.is_locked())
+            # Still locked after level 2 exit
+            self.assertTrue(lock_guard.is_locked())
+        # Released after outermost exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_lock.is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_nested_exception_outer_still_holds_locks(self, mock_fair_locks):
+        """Test that outer context retains locks when inner context raises."""
+        test_lock = fasteners.ReaderWriterLock()
+        mock_fair_locks.get.return_value = test_lock
+        lock_guard = utils.FairLockGuard(['exception-test'])
+
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            try:
+                with lock_guard:
+                    self.assertTrue(lock_guard.is_locked())
+                    raise ValueError("Test exception")
+            except ValueError:
+                pass
+            # Outer context still holds locks after inner raised
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_lock.is_writer())
+        # Released after outer exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_lock.is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_empty_lock_list(self, mock_fair_locks):
+        """Test FairLockGuard with empty lock list."""
+        lock_guard = utils.FairLockGuard([])
+
+        with lock_guard:
+            # No locks to acquire, but should still work
+            self.assertFalse(lock_guard.is_locked())
+
+        mock_fair_locks.get.assert_not_called()
 
 
 class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
@@ -2042,6 +2125,7 @@ class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
 
         executor = utils.StaticallyDelayingCancellableTaskExecutorWrapper(
             0.01, utils._get_default_executor())
+        self.addCleanup(executor.shutdown, wait=True)
 
         future1 = executor.submit_with_delay(task1)
         self.assertEqual(42, future1.result())
@@ -2068,9 +2152,10 @@ class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
         # the wrapper while we submit the second task
         executor = utils.StaticallyDelayingCancellableTaskExecutorWrapper(
             2, utils._get_default_executor())
+        self.addCleanup(executor.shutdown, wait=True)
 
-        future1 = executor.submit_with_delay(task1)
         task1_start = time.monotonic()
+        future1 = executor.submit_with_delay(task1)
         # wait a bit so the wrapper is picking it up and waiting for its
         # deadline
         time.sleep(1)
@@ -2078,8 +2163,8 @@ class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
         self.assertFalse(task1_started.is_set())
 
         # now submit the second task, it will be queued
-        future2 = executor.submit_with_delay(task2)
         task2_start = time.monotonic()
+        future2 = executor.submit_with_delay(task2)
         self.assertFalse(executor._queue.empty())
         self.assertFalse(task1_started.is_set())
 
@@ -2159,6 +2244,7 @@ class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
         # the wrapper when we cancel it
         executor = utils.StaticallyDelayingCancellableTaskExecutorWrapper(
             2, utils._get_default_executor())
+        self.addCleanup(executor.shutdown, wait=True)
 
         future1 = executor.submit_with_delay(task1)
         # wait a bit to let the task being picked up
@@ -2232,6 +2318,7 @@ class StaticallyDelayingCancellableTaskExecutorWrapperTest(test.NoDBTestCase):
     def test_instantaneous_shutdown(self):
         executor = utils.StaticallyDelayingCancellableTaskExecutorWrapper(
             0.1, utils._get_default_executor())
+        self.addCleanup(executor.shutdown, wait=True)
 
         executor.shutdown(wait=False)
         self.assertTrue(executor._shutdown)

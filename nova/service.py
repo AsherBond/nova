@@ -97,11 +97,19 @@ class Service(service.Service):
 
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_enable=None, periodic_fuzzy_delay=None,
-                 periodic_interval_max=None, *args, **kwargs):
+                 periodic_interval_max=None, topic_alt=None,
+                 *args, **kwargs):
         super(Service, self).__init__()
         self.host = host
         self.binary = binary
         self.topic = topic
+        # NOTE(gmaan): If any service would like to create a 2nd rpc server,
+        # then it needs to be created with different topic (topic_alt) so that
+        # oslo.messaging creates the different RPC objects (for example,
+        # dispatcher, consumers, rabbitmq queue, amqp listener, kombu
+        # connection etc). The endpoint (manager) stay same so that same
+        # manager will be serving the both rpc servers.
+        self.topic_alt = topic_alt
         self.manager_class_name = manager
         self.servicegroup_api = servicegroup.API()
         manager_class = importutils.import_class(self.manager_class_name)
@@ -174,8 +182,6 @@ class Service(service.Service):
         if self.backdoor_port is not None:
             self.manager.backdoor_port = self.backdoor_port
 
-        LOG.debug("Creating RPC server for service %s", self.topic)
-
         target = messaging.Target(topic=self.topic, server=self.host)
 
         endpoints = [
@@ -186,8 +192,29 @@ class Service(service.Service):
 
         serializer = objects_base.NovaObjectSerializer()
 
+        LOG.debug("Creating RPC server for service: %s on topic: %s",
+                  self.binary, self.topic)
         self.rpcserver = rpc.get_server(target, endpoints, serializer)
         self.rpcserver.start()
+
+        self.rpcserver_alt = None
+        # NOTE(gmaan): Only compute service creates the two rpcservers which
+        # means each compute service will create two rabiitmq queues bound with
+        # same exchange but on two different topics (1. 'compute'
+        # 2. 'compute-alt').
+        # The main use case for 2nd rpcserver is graceful shutdown of compute
+        # service. During graceful shutdown, the compute service will stop
+        # listening to the new request (stop listening on 'compute' rpcserver)
+        # but continue listening to the 'compute-alt' rpcserver so that it can
+        # finish all their ongoing operations.
+        if self.topic_alt is not None:
+            LOG.debug("Creating 2nd RPC server for service: %s on topic: %s",
+                      self.binary, self.topic_alt)
+            target_alt = messaging.Target(
+                    topic=self.topic_alt, server=self.host)
+            self.rpcserver_alt = rpc.get_server(
+                    target_alt, endpoints, serializer)
+            self.rpcserver_alt.start()
 
         self.manager.post_start_hook()
 
@@ -214,7 +241,8 @@ class Service(service.Service):
     @classmethod
     def create(cls, host=None, binary=None, topic=None, manager=None,
                report_interval=None, periodic_enable=None,
-               periodic_fuzzy_delay=None, periodic_interval_max=None):
+               periodic_fuzzy_delay=None, periodic_interval_max=None,
+               topic_alt=None):
         """Instantiates class and passes back application object.
 
         :param host: defaults to CONF.host
@@ -225,6 +253,7 @@ class Service(service.Service):
         :param periodic_enable: defaults to CONF.periodic_enable
         :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
         :param periodic_interval_max: if set, the max time to wait between runs
+        :param topic_alt: defaults to None
 
         """
         if not host:
@@ -246,7 +275,8 @@ class Service(service.Service):
                           report_interval=report_interval,
                           periodic_enable=periodic_enable,
                           periodic_fuzzy_delay=periodic_fuzzy_delay,
-                          periodic_interval_max=periodic_interval_max)
+                          periodic_interval_max=periodic_interval_max,
+                          topic_alt=topic_alt)
 
         # NOTE(gibi): This have to be after the service object creation as
         # that is the point where we can safely use the RPC to the conductor.
@@ -281,9 +311,22 @@ class Service(service.Service):
     def stop(self):
         """stop the service and clean up."""
         try:
+            LOG.debug('%s service stopping RPC server on topic: %s',
+                      self.binary, self.topic)
             self.rpcserver.stop()
             self.rpcserver.wait()
-        except Exception:
+            LOG.debug('%s service stopped RPC server on topic: %s',
+                      self.binary, self.topic)
+            if self.rpcserver_alt is not None:
+                LOG.debug('%s service stopping the 2nd RPC server on '
+                          'topic: %s', self.binary, self.topic_alt)
+                self.rpcserver_alt.stop()
+                self.rpcserver_alt.wait()
+                LOG.debug('%s service stopped the 2nd RPC server on '
+                          'topic: %s', self.binary, self.topic_alt)
+        except Exception as exc:
+            LOG.exception('Service error occurred during RPC server '
+                          'stop & wait, Error: %s', str(exc))
             pass
 
         try:

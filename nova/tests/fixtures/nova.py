@@ -2214,3 +2214,36 @@ class RPCPollerCleanupFixture(fixtures.Fixture):
                 'instance in your test case e.g. by using '
                 'self.addCleanup(...). The test started the poller at the '
                 'following place:\n%s' % stack)
+
+
+class DelayingExecutorWrapperCleanupFixture(fixtures.Fixture):
+    def setUp(self):
+        super().setUp()
+
+        orig = utils.StaticallyDelayingCancellableTaskExecutorWrapper.__init__
+
+        def wrapped_init(executor_wrapper, delay, executor):
+            stack = "".join(traceback.format_stack())
+            self.addCleanup(
+                self._check_wrapper_stopped, executor_wrapper, stack)
+            orig(executor_wrapper, delay, executor)
+
+        self.useFixture(
+            fixtures.MonkeyPatch(
+                'nova.utils.StaticallyDelayingCancellableTaskExecutorWrapper.'
+                '__init__', wrapped_init))
+
+    @staticmethod
+    def _check_wrapper_stopped(
+        wrapper: utils.StaticallyDelayingCancellableTaskExecutorWrapper,
+        stack: str,
+    ):
+        if wrapper.is_alive:
+            raise RuntimeError(
+                'The test case leaked an active '
+                'nova.utils.StaticallyDelayingCancellableTaskExecutorWrapper'
+                'instance. This can lead to unexpected failures in later test '
+                'case. Please ensure that shutdown(wait=true) is called on '
+                'the wrapper before the end of the test case e.g. by using '
+                'self.addCleanup(...). The test instantiated the wrapper at '
+                'the following place:\n%s' % stack)

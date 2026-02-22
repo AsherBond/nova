@@ -32,6 +32,14 @@ from nova import rpc
 
 CONF = nova.conf.CONF
 RPC_TOPIC = "compute"
+# NOTE(gmaan): The compute service creates two rpc servers which means each
+# compute service worker will be listening on two topic queues (1. 'compute'
+# 2. 'compute-alt'). The 'compute-alt' rpc server is used to handle the
+# graceful shutdown of compute service. During graceful shutdown, 'compute'
+# rpc server will be stopped but 'compute-alt' rpc server will be active for
+# finishing the ongoing operations. The 'compute-alt' topic is supposed to be
+# used in the rpc call/cast which are used to finish the ongoing operations.
+RPC_TOPIC_ALT = "compute-alt"
 
 LOG = logging.getLogger(__name__)
 LAST_VERSION = None

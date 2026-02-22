@@ -22,6 +22,7 @@ import os.path
 from unittest import mock
 
 from oslo_config import cfg
+import oslo_messaging as messaging
 from oslo_service import service as _service
 
 from nova import exception
@@ -265,6 +266,53 @@ class ServiceTestCase(test.NoDBTestCase):
         serv.rpcserver.start.assert_called_once_with()
         serv.rpcserver.stop.assert_called_once_with()
         serv.rpcserver.wait.assert_called_once_with()
+        self.assertIsNone(serv.rpcserver_alt)
+        self.assertEqual(mock_rpc.call_count, 1)
+
+    @mock.patch('nova.objects.service.Service.get_by_host_and_binary')
+    @mock.patch.object(rpc, 'TRANSPORT')
+    @mock.patch.object(messaging, 'get_rpc_server')
+    def test_service_with_two_rpcservers(
+            self, mock_get, mock_TRANSPORT, mock_svc_get):
+        topic_alt = 'fake_alt'
+        fake_manager = 'nova.tests.unit.test_service.FakeManager'
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               fake_manager,
+                               topic_alt=topic_alt)
+        serv.start()
+        serv.stop()
+        target = messaging.Target(topic=self.topic, server=self.host)
+        target_alt = messaging.Target(topic=topic_alt, server=self.host)
+
+        # Check the two calls to oslo.messasing get_rpc_server()
+        # with different target
+        self.assertEqual(mock_get.call_count, 2)
+        mock_get.assert_any_call(mock_TRANSPORT, target, mock.ANY,
+                      executor=mock.ANY, serializer=mock.ANY,
+                      access_policy=mock.ANY)
+        mock_get.assert_any_call(mock_TRANSPORT, target_alt, mock.ANY,
+                      executor=mock.ANY, serializer=mock.ANY,
+                      access_policy=mock.ANY)
+        self.assertIsNotNone(serv.rpcserver)
+        self.assertIsNotNone(serv.rpcserver_alt)
+
+    @mock.patch('nova.objects.service.Service.get_by_host_and_binary')
+    @mock.patch.object(messaging.rpc.server.RPCServer, '_create_listener')
+    def test_service_with_two_rpc_topics_get_two_different_rpcservers(
+            self, mock_listner, mock_svc_get):
+        topic_alt = 'fake_alt'
+        fake_manager = 'nova.tests.unit.test_service.FakeManager'
+        serv = service.Service(self.host,
+                               self.binary,
+                               self.topic,
+                               fake_manager,
+                               topic_alt=topic_alt)
+        serv.start()
+        self.assertIsNotNone(serv.rpcserver)
+        self.assertIsNotNone(serv.rpcserver_alt)
+        self.assertNotEqual(serv.rpcserver, serv.rpcserver_alt)
 
     def test_reset(self):
         serv = service.Service(self.host,
